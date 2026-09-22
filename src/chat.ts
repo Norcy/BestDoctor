@@ -1,7 +1,5 @@
-import OpenAI from "openai";
+import { getAIProvider } from "./ai.js";
 import { doctorReviews, searchDoctors } from "./health160.js";
-
-const MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 
 const CITY_SLUGS: Record<string, string> = {
   深圳: "sz",
@@ -29,51 +27,45 @@ type Intent = {
   keywords: string[];
 };
 
-function getClient() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured");
-  return new OpenAI({ apiKey });
+function validateIntent(value: Intent): Intent {
+  return {
+    city: typeof value.city === "string" ? value.city : "",
+    city_slug: typeof value.city_slug === "string" ? value.city_slug : "",
+    department: typeof value.department === "string" ? value.department : null,
+    department_code:
+      typeof value.department_code === "string" ? value.department_code : null,
+    symptoms: Array.isArray(value.symptoms)
+      ? value.symptoms.filter((x): x is string => typeof x === "string")
+      : [],
+    keywords: Array.isArray(value.keywords)
+      ? value.keywords.filter((x): x is string => typeof x === "string")
+      : [],
+  };
 }
 
 async function parseIntent(message: string, cityHint?: string): Promise<Intent> {
-  const response = await getClient().responses.create({
-    model: MODEL,
-    reasoning: { effort: "none" },
-    max_output_tokens: 300,
-    instructions: [
-      "你是找医生产品的查询解析器，只负责把用户描述转换为结构化查询。",
-      "不要诊断，不要给治疗建议。",
-      "目前健康160科室编码只确定：神经内科=A05。其他科室 department_code 必须返回 null。",
-      "city_slug 只能使用给定城市映射；如果无法识别，返回空字符串。",
-      `城市映射：${JSON.stringify(CITY_SLUGS)}`,
-    ].join("\n"),
-    input: `城市提示：${cityHint || "无"}\n用户输入：${message}`,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "doctor_search_intent",
-        strict: true,
-        schema: {
-          type: "object",
-          properties: {
-            city: { type: "string" },
-            city_slug: { type: "string" },
-            department: { type: ["string", "null"] },
-            department_code: { type: ["string", "null"] },
-            symptoms: { type: "array", items: { type: "string" } },
-            keywords: { type: "array", items: { type: "string" } }
-          },
-          required: ["city", "city_slug", "department", "department_code", "symptoms", "keywords"],
-          additionalProperties: false
-        }
-      }
-    }
-  });
+  const ai = getAIProvider();
 
-  return JSON.parse(response.output_text) as Intent;
+  const system = [
+    "你是找医生产品的查询解析器，只负责把用户描述转换为结构化查询。",
+    "不要诊断，不要给治疗建议。",
+    "目前健康160科室编码只确定：神经内科=A05。其他科室 department_code 必须返回 null。",
+    "city_slug 只能使用给定城市映射；如果无法识别，返回空字符串。",
+    `城市映射：${JSON.stringify(CITY_SLUGS)}`,
+    '输出字段必须严格为：{"city":"","city_slug":"","department":null,"department_code":null,"symptoms":[],"keywords":[]}',
+  ].join("\n");
+
+  const result = await ai.json<Intent>(
+    system,
+    `城市提示：${cityHint || "无"}\n用户输入：${message}`,
+    400,
+  );
+
+  return validateIntent(result);
 }
 
 export async function chatWithDoctorSearch(message: string, cityHint?: string) {
+  const ai = getAIProvider();
   const intent = await parseIntent(message, cityHint);
 
   if (!intent.city_slug && cityHint && CITY_SLUGS[cityHint]) {
@@ -85,7 +77,9 @@ export async function chatWithDoctorSearch(message: string, cityHint?: string) {
     return {
       answer: "我还不能确定你所在的城市。请补充城市，例如“深圳”。",
       intent,
-      doctors: []
+      doctors: [],
+      provider: ai.name,
+      model: ai.model,
     };
   }
 
@@ -109,30 +103,31 @@ export async function chatWithDoctorSearch(message: string, cityHint?: string) {
     }),
   );
 
-  const response = await getClient().responses.create({
-    model: MODEL,
-    reasoning: { effort: "low" },
-    max_output_tokens: 700,
-    instructions: [
-      "你是 BestDoctor 的医生搜索结果解释器。",
-      "只能依据提供的真实候选数据回答，不得编造医生、医院、评分或评价。",
-      "不要做确定性诊断，不要声称某医生一定最好。",
-      "优先解释科室匹配、擅长方向、评价数量和疾病评价分布。",
-      "如果数据不足，要明确说数据不足。",
-      "回答用简洁中文，推荐不超过 5 位候选。",
-      "如症状可能涉及急症，只做一般性的就医紧急性提醒，不给具体治疗方案。"
-    ].join("\n"),
-    input: [
+  const system = [
+    "你是 BestDoctor 的医生搜索结果解释器。",
+    "只能依据提供的真实候选数据回答，不得编造医生、医院、评分或评价。",
+    "不要做确定性诊断，不要声称某医生一定最好。",
+    "优先解释科室匹配、擅长方向、评价数量和疾病评价分布。",
+    "如果数据不足，要明确说数据不足。",
+    "回答用简洁中文，候选不超过 5 位。",
+    "如症状可能涉及急症，只做一般性的就医紧急性提醒，不给具体治疗方案。",
+  ].join("\n");
+
+  const answer = await ai.text(
+    system,
+    [
       `用户问题：${message}`,
       `解析结果：${JSON.stringify(intent)}`,
-      `健康160候选数据：${JSON.stringify(enriched)}`
+      `健康160候选数据：${JSON.stringify(enriched)}`,
     ].join("\n\n"),
-  });
+    700,
+  );
 
   return {
-    answer: response.output_text,
+    answer,
     intent,
     doctors: enriched,
-    model: MODEL,
+    provider: ai.name,
+    model: ai.model,
   };
 }
