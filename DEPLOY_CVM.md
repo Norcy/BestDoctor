@@ -595,3 +595,69 @@ GET /health160/doctor?doc_id=...&unit_id=...&dep_id=...
 核心判断标准只有一个：
 
 > 用户输入“城市 + 症状”后，是否能稳定返回真实、可验证、匹配度合理的医生候选。
+
+
+## 23. 数据层原则：禁止维护健康160映射表
+
+经过重新调研，后续实现必须遵守：
+
+- 不维护 `深圳 -> sz` 之类城市映射表
+- 不维护 `神经内科 -> A05` 之类科室编码表
+- 城市站点从健康160公开城市导航动态解析
+- 科室名称/编码从健康160公开医生搜索筛选链接动态解析
+- 映射允许做运行时缓存，但健康160页面始终是 source of truth
+
+当前数据层新增：
+
+```text
+discoverCities()
+resolveCitySlug(cityName)
+discoverDepartments(citySlug)
+resolveDepartmentCode(citySlug, departmentName)
+crawlDepartmentDoctors(citySlug, departmentCode)
+```
+
+调试 API：
+
+```text
+GET /health160/cities
+GET /health160/departments?city=深圳
+GET /health160/department-doctors?city=深圳&department=神经内科
+```
+
+全量医生抓取的原则：
+
+```text
+城市 + 科室
+→ 动态解析 Health160 科室 code
+→ p-1 / p-2 / p-3 ... 顺序枚举
+→ 以 doctor_id + unit_id + dep_id 去重
+→ 某页为空或不再产生新医生时停止
+→ 得到该城市该科室的完整候选池
+```
+
+注意：
+
+- 健康160原始排序只用于分页枚举，不作为 BestDoctor 推荐排名。
+- BestDoctor 必须在完整候选池上使用自己的评判体系重新计算顺序。
+- 在自有评分体系完成之前，不应把健康160第一页直接包装成“推荐医生”。
+- 由于健康160页面可能针对不同出口环境返回不同 HTML，部署到 CVM 后必须真实验证动态科室解析；失败时应修 parser，而不是恢复静态映射表。
+
+### 当前已确认的站点行为
+
+调研已验证：
+
+- 健康160医生列表 URL 使用 `cno-<科室编码>`。
+- 例如公开搜索结果可见神经内科页面使用 `cno-A05`、心血管内科使用 `cno-A02`、消化内科使用 `cno-A03`。
+- 这些例子只用于验证 URL 机制，**不得复制成静态映射表**。
+- 神经内科列表公开搜索结果显示数百名医生，并存在 `p-N` 分页，因此全量枚举是可行的数据获取模型。
+
+下一阶段应先在真实 CVM 上验证：
+
+```bash
+curl 'http://127.0.0.1:3000/health160/cities'
+curl 'http://127.0.0.1:3000/health160/departments?city=深圳'
+curl 'http://127.0.0.1:3000/health160/department-doctors?city=深圳&department=神经内科&max_pages=3'
+```
+
+先用 `max_pages=3` 验证分页和去重；确认稳定后再跑完整科室池。
