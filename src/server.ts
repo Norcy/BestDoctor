@@ -1,10 +1,33 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { chatWithDoctorSearch } from "./chat.js";
 import { doctorDetail, doctorReviews, Health160Error, searchDoctors } from "./health160.js";
+import { homePage } from "./web.js";
 
 const app = new Hono();
 
+app.get("/", (c) => c.html(homePage));
 app.get("/healthz", (c) => c.json({ ok: true }));
+
+app.post("/chat", async (c) => {
+  try {
+    const body = await c.req.json<{ message?: string; city?: string }>();
+    const message = body.message?.trim();
+
+    if (!message) {
+      return c.json({ error: "message is required" }, 400);
+    }
+
+    if (message.length > 2000) {
+      return c.json({ error: "message is too long" }, 400);
+    }
+
+    return c.json(await chatWithDoctorSearch(message, body.city));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return c.json({ error: message }, 500);
+  }
+});
 
 app.get("/health160/doctor", async (c) => {
   const docId = c.req.query("doc_id");
