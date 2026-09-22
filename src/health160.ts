@@ -62,6 +62,238 @@ function queryId(url: string, ...keys: string[]): string | null {
   return null;
 }
 
+
+
+export type Health160City = {
+  name: string;
+  slug: string;
+  href: string;
+};
+
+export type Health160Department = {
+  name: string;
+  code: string;
+  href: string;
+};
+
+function normalizeLabel(value: string): string {
+  return value
+    .replace(/\s+/g, "")
+    .replace(/(普通)?门诊$/g, "")
+    .replace(/专科$/g, "")
+    .replace(/市$/g, "")
+    .trim();
+}
+
+export async function discoverCities(): Promise<Health160City[]> {
+  // Health160 exposes its city directory in normal public navigation.
+  // Parse it dynamically instead of maintaining city -> subdomain mappings.
+  const seeds = [
+    "https://www.91160.com/",
+    "https://sz.91160.com/search/doctor/cno-A/ysort-1/disease_id-0.html",
+  ];
+
+  const found = new Map<string, Health160City>();
+
+  for (const seed of seeds) {
+    try {
+      const $ = cheerio.load(await getText(seed));
+      $("a[href]").each((_, el) => {
+        const name = clean($(el).text());
+        const hrefRaw = $(el).attr("href");
+        if (!name || !hrefRaw) return;
+
+        let href: URL;
+        try {
+          href = new URL(hrefRaw, seed);
+        } catch {
+          return;
+        }
+
+        const match = href.hostname.match(/^([a-z0-9-]+)\.91160\.com$/i);
+        if (!match) return;
+
+        const slug = match[1].toLowerCase();
+        if (["www", "user", "so", "news", "disease", "weixin", "wxis"].includes(slug)) return;
+        if (!/^[\u4e00-\u9fffA-Za-z·\-]{2,20}$/.test(name)) return;
+
+        const key = normalizeLabel(name);
+        if (!key || found.has(key)) return;
+        found.set(key, { name, slug, href: `https://${href.hostname}/` });
+      });
+
+      if (found.size >= 10) break;
+    } catch {
+      // Try the next public seed page.
+    }
+  }
+
+  return [...found.values()];
+}
+
+export async function resolveCitySlug(cityName: string): Promise<string | null> {
+  const target = normalizeLabel(cityName);
+  if (!target) return null;
+
+  const cities = await discoverCities();
+  const exact = cities.find((city) => normalizeLabel(city.name) === target);
+  if (exact) return exact.slug;
+
+  const fuzzy = cities.find((city) => {
+    const name = normalizeLabel(city.name);
+    return name.includes(target) || target.includes(name);
+  });
+  return fuzzy?.slug || null;
+}
+
+function extractDepartmentLinks(
+  html: string,
+  baseUrl: string,
+): Health160Department[] {
+  const $ = cheerio.load(html);
+  const found = new Map<string, Health160Department>();
+
+  $("a[href]").each((_, el) => {
+    const name = clean($(el).text());
+    const hrefRaw = $(el).attr("href");
+    if (!name || !hrefRaw) return;
+
+    let href: string;
+    try {
+      href = new URL(hrefRaw, baseUrl).toString();
+    } catch {
+      return;
+    }
+
+    const code = href.match(/(?:^|\/)cno-([^/?#.]+)/i)?.[1] || null;
+    if (!code) return;
+
+    // Filter navigation/noise while retaining real department labels.
+    const normalized = normalizeLabel(name);
+    if (!normalized || normalized.length < 2 || normalized.length > 20) return;
+    if (/医生|医院|预约|点评|热门|挂号|更多|收起|职称|服务/.test(normalized)) return;
+
+    const key = `${normalized}|${code.toUpperCase()}`;
+    if (!found.has(key)) {
+      found.set(key, { name, code: code.toUpperCase(), href });
+    }
+  });
+
+  return [...found.values()];
+}
+
+export async function discoverDepartments(
+  citySlug: string,
+): Promise<Health160Department[]> {
+  const slug = citySlug.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  if (!slug) throw new Error("invalid city");
+
+  const origin = `https://${slug}.91160.com`;
+  const rootUrls = [
+    `${origin}/search/doctor/ysort-1/disease_id-0.html`,
+    `${origin}/search/doctor/cno-A/ysort-1/disease_id-0.html`,
+  ];
+
+  const found = new Map<string, Health160Department>();
+  const parentCodes = new Set<string>();
+
+  for (const url of rootUrls) {
+    try {
+      const html = await getText(url);
+      for (const dep of extractDepartmentLinks(html, url)) {
+        const key = `${normalizeLabel(dep.name)}|${dep.code}`;
+        found.set(key, dep);
+        if (/^[A-Z]$/.test(dep.code)) parentCodes.add(dep.code);
+      }
+    } catch {
+      // Continue with the next public page.
+    }
+  }
+
+  // Parent department pages expose their child departments.
+  // The parent codes themselves are discovered from Health160; no local mapping.
+  for (const code of parentCodes) {
+    const url = `${origin}/search/doctor/cno-${code}/ysort-1/disease_id-0.html`;
+    try {
+      const html = await getText(url);
+      for (const dep of extractDepartmentLinks(html, url)) {
+        const key = `${normalizeLabel(dep.name)}|${dep.code}`;
+        found.set(key, dep);
+      }
+    } catch {
+      // A single category page failure should not discard the rest.
+    }
+  }
+
+  return [...found.values()];
+}
+
+export async function resolveDepartmentCode(
+  citySlug: string,
+  departmentName: string,
+): Promise<string | null> {
+  const target = normalizeLabel(departmentName);
+  if (!target) return null;
+
+  const departments = await discoverDepartments(citySlug);
+
+  const exact = departments.find((dep) => normalizeLabel(dep.name) === target);
+  if (exact) return exact.code;
+
+  const fuzzy = departments
+    .filter((dep) => {
+      const name = normalizeLabel(dep.name);
+      return name.includes(target) || target.includes(name);
+    })
+    .sort(
+      (a, b) =>
+        Math.abs(normalizeLabel(a.name).length - target.length) -
+        Math.abs(normalizeLabel(b.name).length - target.length),
+    );
+
+  return fuzzy[0]?.code || null;
+}
+
+export async function crawlDepartmentDoctors(
+  citySlug: string,
+  departmentCode: string,
+  options: { maxPages?: number; sort?: number } = {},
+) {
+  const maxPages = Math.max(1, Math.min(options.maxPages || 500, 500));
+  const sort = options.sort ?? 1;
+  const doctors = new Map<string, Record<string, unknown>>();
+  let pagesFetched = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const results = await searchDoctors(citySlug, departmentCode, page, sort);
+    pagesFetched = page;
+
+    let newCount = 0;
+    for (const doctor of results) {
+      const doctorId = String(doctor.doctor_id || "");
+      const unitId = String(doctor.unit_id || "");
+      const depId = String(doctor.dep_id || "");
+      const key = [doctorId, unitId, depId].join(":");
+      if (!doctorId || doctors.has(key)) continue;
+      doctors.set(key, doctor);
+      newCount++;
+    }
+
+    // Health160 currently paginates doctor lists. Stop when a page is empty
+    // or when pagination no longer yields any new doctor relationship.
+    if (results.length === 0 || newCount === 0) break;
+  }
+
+  return {
+    source: "health160",
+    city: citySlug,
+    department_code: departmentCode,
+    pages_fetched: pagesFetched,
+    doctor_count: doctors.size,
+    doctors: [...doctors.values()],
+  };
+}
+
 export async function doctorDetail(docId: string, unitId: string, depId: string) {
   const url = new URL("/h5/register/doctor/detail.html", BASE);
   url.searchParams.set("unit_id", unitId);
