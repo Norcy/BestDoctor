@@ -1,7 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { chatWithDoctorSearch } from "./chat.js";
-import { doctorDetail, doctorReviews, Health160Error, searchDoctors } from "./health160.js";
+import { crawlDepartmentDoctors, discoverCities, discoverDepartments, doctorDetail, doctorReviews, Health160Error, resolveCitySlug, resolveDepartmentCode, searchDoctors } from "./health160.js";
 import { homePage } from "./web.js";
 
 const app = new Hono();
@@ -26,6 +26,76 @@ app.post("/chat", async (c) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
     return c.json({ error: message }, 500);
+  }
+});
+
+
+
+app.get("/health160/cities", async (c) => {
+  try {
+    return c.json({ results: await discoverCities() });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return c.json({ error: message }, 502);
+  }
+});
+
+app.get("/health160/departments", async (c) => {
+  const city = c.req.query("city");
+  if (!city) return c.json({ error: "city is required" }, 400);
+
+  try {
+    const citySlug = /^[a-z0-9-]+$/i.test(city)
+      ? city.toLowerCase()
+      : await resolveCitySlug(city);
+
+    if (!citySlug) return c.json({ error: "city not found on health160" }, 404);
+
+    return c.json({
+      city,
+      city_slug: citySlug,
+      results: await discoverDepartments(citySlug),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return c.json({ error: message }, 502);
+  }
+});
+
+app.get("/health160/department-doctors", async (c) => {
+  const city = c.req.query("city");
+  const department = c.req.query("department");
+  const code = c.req.query("code");
+  const maxPages = Number(c.req.query("max_pages") || "500");
+
+  if (!city) return c.json({ error: "city is required" }, 400);
+  if (!department && !code) {
+    return c.json({ error: "department or code is required" }, 400);
+  }
+  if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 500) {
+    return c.json({ error: "invalid max_pages" }, 400);
+  }
+
+  try {
+    const citySlug = /^[a-z0-9-]+$/i.test(city)
+      ? city.toLowerCase()
+      : await resolveCitySlug(city);
+
+    if (!citySlug) return c.json({ error: "city not found on health160" }, 404);
+
+    const departmentCode =
+      code || (department ? await resolveDepartmentCode(citySlug, department) : null);
+
+    if (!departmentCode) {
+      return c.json({ error: "department not found on health160" }, 404);
+    }
+
+    return c.json(
+      await crawlDepartmentDoctors(citySlug, departmentCode, { maxPages }),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return c.json({ error: message }, error instanceof Health160Error ? 502 : 500);
   }
 });
 
