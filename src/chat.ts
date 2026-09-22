@@ -1,7 +1,6 @@
 import OpenAI from "openai";
 import { doctorReviews, searchDoctors } from "./health160.js";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 
 const CITY_SLUGS: Record<string, string> = {
@@ -30,8 +29,14 @@ type Intent = {
   keywords: string[];
 };
 
+function getClient() {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured");
+  return new OpenAI({ apiKey });
+}
+
 async function parseIntent(message: string, cityHint?: string): Promise<Intent> {
-  const response = await client.responses.create({
+  const response = await getClient().responses.create({
     model: MODEL,
     reasoning: { effort: "none" },
     max_output_tokens: 300,
@@ -69,10 +74,6 @@ async function parseIntent(message: string, cityHint?: string): Promise<Intent> 
 }
 
 export async function chatWithDoctorSearch(message: string, cityHint?: string) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is not configured");
-  }
-
   const intent = await parseIntent(message, cityHint);
 
   if (!intent.city_slug && cityHint && CITY_SLUGS[cityHint]) {
@@ -108,7 +109,7 @@ export async function chatWithDoctorSearch(message: string, cityHint?: string) {
     }),
   );
 
-  const response = await client.responses.create({
+  const response = await getClient().responses.create({
     model: MODEL,
     reasoning: { effort: "low" },
     max_output_tokens: 700,
